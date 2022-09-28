@@ -1,0 +1,13 @@
+(unit MM)
+
+(package "AP7366-33W5-7"
+    (type UNDEF)
+    (uver 2)
+    (cuser "SamacSys")
+    (uuser "SamacSys")
+    (utime 2019-04-19-07:57:14)
+    (mountForm default
+        (footprintRef "SOT95P285X130-5N")
+        (spec "System")
+    )
+)

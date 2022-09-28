@@ -1,0 +1,20 @@
+.AP7366-33W5-7 :1 ;LDO Voltage Regulators LDO CMOS HiCurr SOT25 T&R 3K
+SOT95P285X130-5N
+*STM IC
+*NGS
+*PLB 1="IN" 2="GND" 3="EN" 4="NC" 5="OUT"
+*MXP 5
+*DFN AP7366-33W5-7
+~!Manufacturer_Name (Diodes Inc.)
+~!Manufacturer_Part_Number (AP7366-33W5-7)
+~!Mouser Part Number (621-AP7366-33W5-7)
+~!Link Mouser Price/Stock (https://www.mouser.co.uk/ProductDetail/Diodes-Incorporated/AP7366-33W5-7?qs=u16ybLDytRbu2A9WgiVqlQ%3D%3D)
+~!Arrow Part Number (AP7366-33W5-7)
+~!Link Arrow Price/Stock (https://www.arrow.com/en/products/ap7366-33w5-7/diodes-incorporated?region=nac)
+~!Mouser Testing Part Number (-)
+~!Mouser Testing Price/Stock (-)
+~!Link Datasheet (https://www.diodes.com/assets/Datasheets/AP7366.pdf)
+~!Height (1.3mm)
+~!3D_Model (AP7366-33W5-7)
+AP7366-33W5-7
+1.1!U 2.1!U 3.1!U 4.1!U 5.1!U 

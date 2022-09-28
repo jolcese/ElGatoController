@@ -1,0 +1,11 @@
+FILE_TYPE = MULTI_PHYS_TABLE;
+
+PART 'AP7366_33W5_7'
+CLASS = IC
+{========================================================================================}
+:"MANUFACTURER_NAME", "MANUFACTURER_PART_NUMBER"= "PART_NUMBER", "JEDEC_TYPE", "PACK_TYPE", "MOUSER_PART_NUMBER", "MOUSER_PRICE/STOCK", "ARROW_PART_NUMBER", "ARROW_PRICE/STOCK", "MOUSER_TESTING_PART_NUMBER", "MOUSER_TESTING_PRICE/STOCK", "DESCRIPTION", "DATASHEET", "HEIGHT";
+{========================================================================================}
+ "Diodes Inc.", "AP7366-33W5-7" (!) = "", "SOT95P285X130-5N", "SOT23 (5-Pin)", "621-AP7366-33W5-7", "https://www.mouser.co.uk/ProductDetail/Diodes-Incorporated/AP7366-33W5-7?qs=u16ybLDytRbu2A9WgiVqlQ%3D%3D", "AP7366-33W5-7", "https://www.arrow.com/en/products/ap7366-33w5-7/diodes-incorporated?region=nac", "", "", "LDO Voltage Regulators LDO CMOS HiCurr SOT25 T&R 3K", "https://www.diodes.com/assets/Datasheets/AP7366.pdf", "1.3 mm"
+END_PART
+
+END.

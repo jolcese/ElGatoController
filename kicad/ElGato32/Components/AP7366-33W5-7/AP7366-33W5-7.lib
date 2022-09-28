@@ -1,0 +1,26 @@
+EESchema-LIBRARY Version 2.3
+#encoding utf-8
+#(c) SnapEDA 2016 (snapeda.com)
+#This work is licensed under a Creative Commons Attribution-ShareAlike 4.0 International License (CC BY-SA) with Design Exception 1.0
+#
+# AP7366-33W5-7
+#
+DEF AP7366-33W5-7 VR 0 40 Y Y 1 L N
+F0 "VR" -300 250 50 H V L BNN
+F1 "AP7366-33W5-7" -300 -250 50 H V L BNN
+F2 "SOT95P285X140-5N" 0 0 50 H I L BNN
+F3 "" 0 0 50 H I L BNN
+F4 "IPC-7351B" 0 0 50 H I L BNN "STANDARD"
+F5 "1.4 mm" 0 0 50 H I L BNN "MAXIMUM_PACKAGE_HEIGHT"
+F6 "DIODES" 0 0 50 H I L BNN "MANUFACTURER"
+F7 "1-2" 0 0 50 H I L BNN "PARTREV"
+DRAW
+S -300 -200 300 200 0 0 10 f
+X IN 1 -500 100 200 R 40 40 0 0 I 
+X EN 3 -500 0 200 R 40 40 0 0 I 
+X GND 2 500 -100 200 L 40 40 0 0 W 
+X OUT 5 500 100 200 L 40 40 0 0 O 
+ENDDRAW
+ENDDEF
+#
+# End Library

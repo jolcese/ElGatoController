@@ -1,0 +1,9 @@
+EESchema-DOCLIB  Version 2.0
+#
+$CMP AP7366-33W5-7
+D LDO Voltage Regulators LDO CMOS HiCurr SOT25 T&R 3K
+K
+F https://www.diodes.com/assets/Datasheets/AP7366.pdf
+$ENDCMP
+#
+#End Doc Library
