@@ -2,17 +2,6 @@
  *  ElGato Controller
  *
 */
-
-// To Do:
-//
-//  NTP
-//  ~Wifi Portal~
-//  Dynamic lights config/ Web Server
-//  Shortcut reboot
-//  Brightness
-//  ~OLED Status~
-//  Faster REST
-//  FIx BAR size
  
 #include <Arduino.h>
 
