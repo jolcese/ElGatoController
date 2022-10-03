@@ -5,11 +5,11 @@
   ## Description
   This is a standalone controller for the ElGato Lights. It's based on an ESP-WROOM-32 module but any ESP32 (or even ESP8266) should work with minimal changes.
 
-  <img src="./support/ControllerReal.jpg" width="600">
+  <figure><img src="support/ControllerReal.jpg" width="600"><figcaption>Controller with Display and #d Printed Case</figcaption></figure>
 
-  Display has been added after designing the PCB so no header/connector.
+  <figure><img src="support/schematic.png" width="600"><figcaption>Schematic for the module, USB-UART controller and buttons</figcaption></figure>
 
-  <img src="./support/PCB/PCB.jpg" width="600">
+  <figure><img src="support/PCB/PCB.jpg" width="600"><figcaption>Display has been added after designing the PCB so no header/connector</figcaption></figure>
 
 
   ## Table of Contents
