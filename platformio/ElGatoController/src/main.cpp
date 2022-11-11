@@ -331,21 +331,32 @@ void setLightState(String ip, JSONVar payload) {
 
   Serial.print ("PUT: http://" + ip + ":9123/elgato/lights - ");
   Serial.println(JSON.stringify(payload));
-  httpClient.begin(client, "http://" + ip + ":9123/elgato/lights");
-  httpClient.addHeader("Content-Type", "application/json");
-  httpReturnCode = httpClient.PUT(JSON.stringify(payload));
 
-  // httpReturnCode will be negative on error
-  if (httpReturnCode > 0) {
-    if (httpReturnCode == HTTP_CODE_OK) {
-      const String& payload = httpClient.getString();
-      Serial.print("Status: ");
-      Serial.println(HTTP_CODE_OK);
+  bool exitloop = false;
+  int counter = 0;
+
+  while (exitloop == false) {
+    httpClient.begin(client, "http://" + ip + ":9123/elgato/lights");
+    httpClient.addHeader("Content-Type", "application/json");
+    httpReturnCode = httpClient.PUT(JSON.stringify(payload));
+
+    // httpReturnCode will be negative on error
+    if (httpReturnCode > 0) {
+      if (httpReturnCode == HTTP_CODE_OK) {
+        const String& payload = httpClient.getString();
+        Serial.print("Status: ");
+        Serial.println(HTTP_CODE_OK);
+
+        exitloop = true;
+      }
+    } else {
+      Serial.printf("[HTTP] PUT... failed, error: %s\n", httpClient.errorToString(httpReturnCode).c_str());
     }
-  } else {
-    Serial.printf("[HTTP] PUT... failed, error: %s\n", httpClient.errorToString(httpReturnCode).c_str());
+    counter++;
+    if (counter > 3) exitloop = true;
+    
+    httpClient.end();
   }
-  httpClient.end();
 }
 
 void actionLight() {

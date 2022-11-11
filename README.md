@@ -7,6 +7,7 @@
 
   <figure><img src="support/ControllerReal.jpg" width="600"><figcaption>Controller with Display and 3D Printed Case</figcaption></figure>
   <br>
+  <br>
   <figure><img src="support/schematic.png" width="600"><figcaption>Schematic for the module, USB-UART controller and buttons</figcaption></figure>
   <br>
   <figure><img src="support/PCB/PCB.jpg" width="600"><figcaption>Display has been added after designing the PCB so no header/connector</figcaption></figure>
