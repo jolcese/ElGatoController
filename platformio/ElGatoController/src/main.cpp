@@ -7,6 +7,7 @@
 
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <ESPmDNS.h>
 
 #include <WiFiManager.h>          //https://github.com/tzapu/WiFiManager WiFi Configuration Magic
 WiFiManager gWifiManager;
@@ -22,9 +23,18 @@ boolean gFirstBoot = true;
 
 #include "display.h"
 #include "logos.h"
+#include "version.h"
 
-const String sLight1 = "192.168.30.137";
-const String sLight2 = "192.168.30.161";
+// Elgato lights discovered via mDNS (_elg._tcp)
+#define MAX_LIGHTS 8
+String gLights[MAX_LIGHTS];
+int gLightCount = 0;
+bool gMdnsStarted = false;
+bool gLightsOnline = false;                             // last poll reached a light?
+
+// Re-discover at least this often so stale DHCP IPs self-heal without a reboot
+#define DISCOVER_INTERVAL 1800000UL                     // 30 minutes
+unsigned long lastDiscoverMillis = 0;
 
 // Hardware Pins
 const int ledWifiPin = 4;                       // D3
@@ -33,8 +43,8 @@ const int ledOnOffPin = 2;                      // D2
 const int buttonOnOffPin = 12;                  // SW2
 const int buttonIncreaseBrightnessPin = 13;     // SW3
 const int buttonDecreaseBrightnessPin = 15;     // SW5      
-const int buttonIncreaseTemperaturePin = 14;    // SW4
-const int buttonDecreaseTemperaturePin = 16;    // SW6  
+const int buttonIncreaseTemperaturePin = 16;    // SW6 (swapped: temp buttons were inverted)
+const int buttonDecreaseTemperaturePin = 14;    // SW4 (swapped: temp buttons were inverted)
 
 // Buttons states
 int onOffState = HIGH;                          // the current reading from the input pin
@@ -62,13 +72,18 @@ unsigned long previousPollMillis = 0;                   // the last time poll wa
 unsigned long pollDelay = 300000;
 
 unsigned long previousActionMillis = 0;                 // the last time Action was sent
-unsigned long actionDelay = 600;
+unsigned long actionDelay = 150;                        // batch rapid taps, but stay responsive
 
 bool action = false;
 
-bool actionOnOff = false;
-int actionBrightnessDelta = 0;
-int actionTemperatureDelta = 0;
+// Display power management (anti burn-in): dim then blank the OLED when idle,
+// wake instantly on any button press. The controller sits idle most of the day,
+// so a mostly-static image lit 24/7 is what wears out the "always on" pixels.
+#define DISPLAY_DIM_TIMEOUT 15000UL                     // dim after 15s idle
+#define DISPLAY_OFF_TIMEOUT 60000UL                     // blank after 60s idle
+unsigned long lastInteractionMillis = 0;                // last button press
+bool gDisplayOn = true;
+bool gDisplayDimmed = false;
 
 #define BRIGHT_MIN 0
 #define BRIGHT_MAX 100
@@ -201,6 +216,36 @@ void WiFiEvent(WiFiEvent_t event)
 }
 
 
+// Turn the panel back to full brightness. The GDDRAM buffer keeps being
+// refreshed by updateDisplay() even while blanked, so content is current.
+void wakeDisplay() {
+  if (!gDisplayOn) {
+    display.ssd1306_command(SSD1306_DISPLAYON);
+    gDisplayOn = true;
+  }
+  if (gDisplayDimmed) {
+    display.dim(false);
+    gDisplayDimmed = false;
+  }
+}
+
+// Dim after a short idle, fully blank after a longer idle.
+void manageDisplayPower(unsigned long now) {
+  unsigned long idle = now - lastInteractionMillis;
+
+  if (idle >= DISPLAY_OFF_TIMEOUT) {
+    if (gDisplayOn) {
+      display.ssd1306_command(SSD1306_DISPLAYOFF);
+      gDisplayOn = false;
+    }
+  } else if (idle >= DISPLAY_DIM_TIMEOUT) {
+    if (!gDisplayDimmed) {
+      display.dim(true);
+      gDisplayDimmed = true;
+    }
+  }
+}
+
 void updateDisplay() {
 
   display.clearDisplay();
@@ -226,7 +271,9 @@ void updateDisplay() {
   display.drawLine(127 - BAR_LEN - BAR_SPACE - BAR_LEN, 30, 127 - BAR_LEN - BAR_SPACE - BAR_LEN + brightBar, 30, SSD1306_WHITE);
   display.drawLine(127 - BAR_LEN - BAR_SPACE - BAR_LEN, 31, 127 - BAR_LEN - BAR_SPACE - BAR_LEN + brightBar, 31, SSD1306_WHITE);
 
-  int tempBar = ((temperatureState - TEMP_MIN) * (BAR_LEN) / (TEMP_MAX - TEMP_MIN));
+  // Kelvin is inverse to the raw Elgato value, so invert the bar to match the
+  // displayed K number (low K -> short bar, high K -> long bar).
+  int tempBar = BAR_LEN - ((temperatureState - TEMP_MIN) * (BAR_LEN) / (TEMP_MAX - TEMP_MIN));
   display.drawLine(127, 30, 127, 31, SSD1306_WHITE);
   display.drawLine(127 - BAR_LEN, 30, 127 - BAR_LEN , 31, SSD1306_WHITE);
   display.drawLine(127 - BAR_LEN, 30, 127 - BAR_LEN + tempBar, 30, SSD1306_WHITE);
@@ -247,6 +294,15 @@ void updateDisplay() {
     digitalWrite(ledOnOffPin, HIGH);
   }
 
+  // Lights connectivity indicator (top-left): filled dot = reachable,
+  // hollow circle with a slash = unreachable (stale IP / light offline).
+  if (gLightsOnline) {
+    display.fillCircle(3, 4, 2, SSD1306_WHITE);
+  } else {
+    display.drawCircle(3, 4, 3, SSD1306_WHITE);
+    display.drawLine(1, 6, 5, 2, SSD1306_WHITE);
+  }
+
   display.display();
 }
 
@@ -256,6 +312,8 @@ void setup()
   Serial.begin(115200);
   Serial.println();
   Serial.println();
+  Serial.printf("ElGato Controller v%s (git %s, built %s %s)\n",
+                FW_VERSION, GIT_REV, __DATE__, __TIME__);
 
   // Setup hardware oins
   pinMode(ledWifiPin, OUTPUT);
@@ -271,7 +329,11 @@ void setup()
   pinMode(buttonDecreaseTemperaturePin, INPUT_PULLUP);
 
   // Setup Wifi
-  WiFi.mode(WIFI_STA); // explicitly set mode, esp defaults to STA+AP   
+  WiFi.mode(WIFI_STA); // explicitly set mode, esp defaults to STA+AP
+  // Disable modem power save: it drops multicast packets, which makes mDNS
+  // discovery flaky and intermittent. This board is mains-powered, so the
+  // extra radio-on current is a non-issue.
+  WiFi.setSleep(false);
   WiFi.onEvent(WiFiEvent);
 
   // Reset Wifi setting if OnOff pressed for 5 seconds
@@ -287,23 +349,89 @@ void setup()
   // gWebServer.begin();
 
   setupDisplay();
+  lastInteractionMillis = millis();
   updateDisplay();
 }
 
-void getLightState() {
-  
+void discoverLights() {
+
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  // mDNS responder must be running before we can query
+  if (!gMdnsStarted) {
+    if (MDNS.begin(gHostName)) {
+      gMdnsStarted = true;
+    } else {
+      Serial.println("discoverLights - MDNS.begin() failed");
+      return;
+    }
+  }
+
+  // Elgato Key Lights advertise the service _elg._tcp. mDNS answers trickle in
+  // across queries and not every light replies to the first one, so run a few
+  // passes and merge unique IPs rather than trusting a single query.
+  gLightCount = 0;
+  for (int pass = 1; pass <= 3 && gLightCount < MAX_LIGHTS; pass++) {
+    Serial.printf("discoverLights - querying _elg._tcp (pass %d/3) ...\n", pass);
+    int n = MDNS.queryService("elg", "tcp");
+
+    for (int i = 0; i < n && gLightCount < MAX_LIGHTS; i++) {
+      String host = MDNS.hostname(i);
+      IPAddress ip = MDNS.IP(i);
+
+      // The A record sometimes lags the SRV/PTR answer, leaving IP as 0.0.0.0.
+      // Resolve the hostname directly as a fallback.
+      if (ip == IPAddress((uint32_t)0)) {
+        ip = MDNS.queryHost(host.c_str());
+      }
+      if (ip == IPAddress((uint32_t)0)) {
+        Serial.printf("discoverLights - skipping %s (could not resolve IP)\n", host.c_str());
+        continue;
+      }
+
+      // Skip IPs we already recorded in an earlier pass.
+      String ipStr = ip.toString();
+      bool known = false;
+      for (int j = 0; j < gLightCount; j++) {
+        if (gLights[j] == ipStr) { known = true; break; }
+      }
+      if (known) continue;
+
+      gLights[gLightCount] = ipStr;
+      Serial.printf("discoverLights - found light %d: %s (%s:%d)\n",
+                    gLightCount,
+                    host.c_str(),
+                    ipStr.c_str(),
+                    MDNS.port(i));
+      gLightCount++;
+    }
+  }
+  Serial.printf("discoverLights - %d light(s) found\n", gLightCount);
+}
+
+// Returns true if the light responded; also updates gLightsOnline so the
+// display can show whether the lights are reachable.
+bool getLightState() {
+
   JSONVar myJSONPayload;
+
+  if (gLightCount == 0) {
+    Serial.println("getLightState - no lights discovered yet");
+    gLightsOnline = false;
+    return false;
+  }
 
   WiFiClient client;
   HTTPClient httpClient;
   int httpReturnCode;
 
-  // Get status from Left Light
-  Serial.println("getLightState - GET: http://" + sLight1 + ":9123/elgato/lights");
-  httpClient.begin(client, "http://" + sLight1 + ":9123/elgato/lights"); //HTTP
+  // Get status from the first discovered light
+  Serial.println("getLightState - GET: http://" + gLights[0] + ":9123/elgato/lights");
+  httpClient.begin(client, "http://" + gLights[0] + ":9123/elgato/lights"); //HTTP
   httpClient.addHeader("Content-Type", "application/json");
   httpReturnCode = httpClient.GET();
 
+  bool ok = false;
   if (httpReturnCode == HTTP_CODE_OK) {
     const String& payload = httpClient.getString();
     Serial.print("getLightState - Status: ");
@@ -316,10 +444,14 @@ void getLightState() {
     brightnessState = (int)myJSONPayload["lights"][0]["brightness"];
     temperatureState = (int)myJSONPayload["lights"][0]["temperature"];
 
+    ok = true;
   } else {
     Serial.printf("getLightState - GET... failed, error: %s\n", httpClient.errorToString(httpReturnCode).c_str());
   }
   httpClient.end();
+
+  gLightsOnline = ok;
+  return ok;
 }
 
 void setLightState(String ip, JSONVar payload) {
@@ -327,6 +459,7 @@ void setLightState(String ip, JSONVar payload) {
   int httpReturnCode;
 
   WiFiClient client;
+  client.setNoDelay(true);  // send the small PUT immediately (no Nagle buffering)
   HTTPClient httpClient;
 
   Serial.print ("PUT: http://" + ip + ":9123/elgato/lights - ");
@@ -359,59 +492,19 @@ void setLightState(String ip, JSONVar payload) {
   }
 }
 
+// Pushes the current (already-updated) state to every light. Button presses
+// apply their delta to the local state immediately in loop() for instant
+// on-screen feedback; this just sends that state over the network, batched.
 void actionLight() {
   JSONVar myJSONPayload;
 
-  getLightState();
-
-  // Fill payload with all data
   myJSONPayload["lights"][0]["on"] = onOffLightState;
   myJSONPayload["lights"][0]["brightness"] = brightnessState;
   myJSONPayload["lights"][0]["temperature"] = temperatureState;
 
-  // On Off
-  if (actionOnOff == true) {
-    // Toggle state
-    if (onOffLightState == 0) {
-      onOffLightState = 1;
-      myJSONPayload["lights"][0]["on"] = 1;
-    } else {
-      onOffLightState = 0;
-      myJSONPayload["lights"][0]["on"] = 0;
-    }
+  for (int i = 0; i < gLightCount; i++) {
+    setLightState(gLights[i], myJSONPayload);
   }
-  actionOnOff = false;
-
-  // Brightness
-  if (actionBrightnessDelta != 0) {
-    brightnessState += actionBrightnessDelta;
-
-    if (brightnessState < BRIGHT_MIN) {
-      brightnessState = BRIGHT_MIN;
-    }
-    if (brightnessState > BRIGHT_MAX) {
-      brightnessState = BRIGHT_MAX;
-    }      
-    myJSONPayload["lights"][0]["brightness"] = brightnessState;
-  }
-  actionBrightnessDelta = 0;
-
-  // Temperature
-  if (actionTemperatureDelta != 0) {
-    temperatureState += actionTemperatureDelta;
-
-    if (temperatureState < TEMP_MIN) {
-      temperatureState = TEMP_MIN;
-    }
-    if (temperatureState > TEMP_MAX) {
-      temperatureState = TEMP_MAX;
-    }      
-    myJSONPayload["lights"][0]["temperature"] = temperatureState;
-  }
-  actionTemperatureDelta = 0;
-
-  setLightState(sLight1, myJSONPayload);
-  setLightState(sLight2, myJSONPayload);
 
 }
 
@@ -441,44 +534,71 @@ void loop()
   unsigned long localMillis = millis();
 
   // OnOff Button
-  actionOnOff = actionOnOff || evaluateButton(buttonOnOffPin,
-                                              localMillis, 
-                                              & onOffState, 
-                                              & lastOnOffState, 
-                                              & lastOnOffDebounceTime, 
-                                              1);
+  int onOffPress = evaluateButton(buttonOnOffPin,
+                                  localMillis,
+                                  & onOffState,
+                                  & lastOnOffState,
+                                  & lastOnOffDebounceTime,
+                                  1);
 
   // IncreaseBrightness Button
-  actionBrightnessDelta += evaluateButton(buttonIncreaseBrightnessPin,
-                                          localMillis, 
-                                          & increaseBrightnessState, 
-                                          & lastIncreaseBrightnessState, 
-                                          & lastIncreaseBrightnessDebounceTime, 
+  int increaseBrightnessPress = evaluateButton(buttonIncreaseBrightnessPin,
+                                          localMillis,
+                                          & increaseBrightnessState,
+                                          & lastIncreaseBrightnessState,
+                                          & lastIncreaseBrightnessDebounceTime,
                                           BRIGHT_STEP);
 
   // DecreaseBrightness Button
-  actionBrightnessDelta -= evaluateButton(buttonDecreaseBrightnessPin,
-                                          localMillis, 
-                                          & decreaseBrightnessState, 
-                                          & lastDecreaseBrightnessState, 
-                                          & lastDecreaseBrightnessDebounceTime, 
+  int decreaseBrightnessPress = evaluateButton(buttonDecreaseBrightnessPin,
+                                          localMillis,
+                                          & decreaseBrightnessState,
+                                          & lastDecreaseBrightnessState,
+                                          & lastDecreaseBrightnessDebounceTime,
                                           BRIGHT_STEP);
 
   // IncreaseTemperature Button
-  actionTemperatureDelta += evaluateButton(buttonIncreaseTemperaturePin,
-                                          localMillis, 
-                                          & increaseTemperatureState, 
-                                          & lastIncreaseTemperatureState, 
-                                          & lastIncreaseTemperatureDebounceTime, 
+  int increaseTemperaturePress = evaluateButton(buttonIncreaseTemperaturePin,
+                                          localMillis,
+                                          & increaseTemperatureState,
+                                          & lastIncreaseTemperatureState,
+                                          & lastIncreaseTemperatureDebounceTime,
                                           TEMP_STEP);
 
   // DecreaseTemperature Button
-  actionTemperatureDelta -= evaluateButton(buttonDecreaseTemperaturePin,
-                                          localMillis, 
-                                          & decreaseTemperatureState, 
-                                          & lastDecreaseTemperatureState, 
-                                          & lastDecreaseTemperatureDebounceTime, 
+  int decreaseTemperaturePress = evaluateButton(buttonDecreaseTemperaturePin,
+                                          localMillis,
+                                          & decreaseTemperatureState,
+                                          & lastDecreaseTemperatureState,
+                                          & lastDecreaseTemperatureDebounceTime,
                                           TEMP_STEP);
+
+  // Apply each press to the local state immediately so the display reacts
+  // instantly; the actual light PUT is sent (batched) a moment later.
+  if (onOffPress) {
+    onOffLightState = (onOffLightState == 0) ? 1 : 0;
+  }
+
+  int brightnessDelta = increaseBrightnessPress - decreaseBrightnessPress;
+  if (brightnessDelta != 0) {
+    brightnessState += brightnessDelta;
+    if (brightnessState < BRIGHT_MIN) brightnessState = BRIGHT_MIN;
+    if (brightnessState > BRIGHT_MAX) brightnessState = BRIGHT_MAX;
+  }
+
+  int temperatureDelta = increaseTemperaturePress - decreaseTemperaturePress;
+  if (temperatureDelta != 0) {
+    temperatureState += temperatureDelta;
+    if (temperatureState < TEMP_MIN) temperatureState = TEMP_MIN;
+    if (temperatureState > TEMP_MAX) temperatureState = TEMP_MAX;
+  }
+
+  // Any button press wakes the display and resets the idle timer (anti burn-in)
+  if (onOffPress || brightnessDelta != 0 || temperatureDelta != 0) {
+    lastInteractionMillis = localMillis;
+    wakeDisplay();
+  }
+  manageDisplayPower(localMillis);
 
   updateDisplay();
 
@@ -491,12 +611,28 @@ void loop()
     actionLight();
   }
 
-  // Polling light 
-  if (((localMillis - previousPollMillis) > pollDelay || previousPollMillis == 0 ) && WiFi.status() == WL_CONNECTED) {
-    previousPollMillis = localMillis;    
+  // Polling light. While no lights are known (e.g. a transient discovery miss
+  // at startup) retry quickly rather than waiting the full poll interval.
+  unsigned long effectivePollDelay = (gLightCount == 0) ? 30000UL : pollDelay;
+  if (((localMillis - previousPollMillis) > effectivePollDelay || previousPollMillis == 0 ) && WiFi.status() == WL_CONNECTED) {
+    previousPollMillis = localMillis;
+
+    // (Re)discover lights if we don't know any yet, or on a periodic interval
+    // so a light that changed IP (DHCP) is picked up without a reboot.
+    if (gLightCount == 0 || (localMillis - lastDiscoverMillis) > DISCOVER_INTERVAL) {
+      discoverLights();
+      lastDiscoverMillis = localMillis;
+    }
 
     Serial.println("loop - calling getLightState()...");
-    getLightState();
+    if (!getLightState() && gLightCount > 0) {
+      // A known light stopped answering - most likely a stale IP. Force a
+      // fresh discovery and retry once so it self-heals.
+      Serial.println("loop - light unreachable, re-discovering...");
+      discoverLights();
+      lastDiscoverMillis = localMillis;
+      getLightState();
+    }
   }
 
   while (WiFi.status() != WL_CONNECTED && gFirstBoot == false )
