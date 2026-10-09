@@ -68,6 +68,17 @@ unsigned long lastIncreaseTemperatureDebounceTime = 0;  // the last time the out
 unsigned long lastDecreaseTemperatureDebounceTime = 0;  // the last time the output pin was toggled
 unsigned long debounceDelay = 50;                       // the debounce time; increase if the output flickers
 
+// Button-press latches: filled by buttonTask (core 0), drained by loop() (core 1).
+// A dedicated task samples the buttons continuously so presses are never missed while
+// loop() is blocked in network I/O (mDNS discovery / HTTP). Guarded by gButtonMux.
+portMUX_TYPE gButtonMux = portMUX_INITIALIZER_UNLOCKED;
+int gPendingOnOffToggles = 0;
+int gPendingBrightnessDelta = 0;                        // accumulated, in brightness units
+int gPendingTemperatureDelta = 0;                       // accumulated, in temperature units
+bool gPendingInteraction = false;
+TaskHandle_t gButtonTaskHandle = nullptr;
+void buttonTask(void *);                                // defined below, started in setup()
+
 unsigned long previousPollMillis = 0;                   // the last time poll was done
 unsigned long pollDelay = 300000;
 
@@ -306,6 +317,35 @@ void updateDisplay() {
   display.display();
 }
 
+// Brief power-on splash: ElGato (cat) logo on the left, firmware/build/network
+// info on the right. Shown once at boot.
+void showSplashScreen() {
+  display.clearDisplay();
+
+  // ElGato logo
+  display.drawBitmap(0, 2, cat_on_logo, CAT_WIDTH, CAT_HEIGHT, SSD1306_WHITE);
+
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  const int x = 30;  // text column, to the right of the logo
+  display.setCursor(x, 0);
+  display.print("ElGato");
+  display.setCursor(x, 8);
+  display.printf("v%s %s", FW_VERSION, GIT_REV);
+  display.setCursor(x, 16);
+  if (WiFi.status() == WL_CONNECTED) {
+    display.print(WiFi.localIP().toString());
+  } else {
+    display.print("no IP yet");
+  }
+  display.setCursor(x, 24);
+  display.print(__DATE__);
+
+  display.display();
+  delay(4000);
+}
+
 
 void setup()
 {
@@ -328,6 +368,10 @@ void setup()
   pinMode(buttonIncreaseTemperaturePin, INPUT_PULLUP);
   pinMode(buttonDecreaseTemperaturePin, INPUT_PULLUP);
 
+  // Sample buttons in a dedicated task on core 0 so presses are never missed
+  // while loop() (core 1) is blocked in network I/O.
+  xTaskCreatePinnedToCore(buttonTask, "buttonTask", 2048, nullptr, 2, &gButtonTaskHandle, 0);
+
   // Setup Wifi
   WiFi.mode(WIFI_STA); // explicitly set mode, esp defaults to STA+AP
   // Disable modem power save: it drops multicast packets, which makes mDNS
@@ -349,6 +393,7 @@ void setup()
   // gWebServer.begin();
 
   setupDisplay();
+  showSplashScreen();
   lastInteractionMillis = millis();
   updateDisplay();
 }
@@ -368,11 +413,13 @@ void discoverLights() {
   }
 
   // Elgato Key Lights advertise the service _elg._tcp. mDNS answers trickle in
-  // across queries and not every light replies to the first one, so run a few
-  // passes and merge unique IPs rather than trusting a single query.
+  // across queries and not every light replies to the first one, so run a couple
+  // of passes and merge unique IPs rather than trusting a single query. Each pass
+  // blocks ~3s, so 2 passes caps the blocking window at ~6s (the buttonTask keeps
+  // sampling throughout regardless).
   gLightCount = 0;
-  for (int pass = 1; pass <= 3 && gLightCount < MAX_LIGHTS; pass++) {
-    Serial.printf("discoverLights - querying _elg._tcp (pass %d/3) ...\n", pass);
+  for (int pass = 1; pass <= 2 && gLightCount < MAX_LIGHTS; pass++) {
+    Serial.printf("discoverLights - querying _elg._tcp (pass %d/2) ...\n", pass);
     int n = MDNS.queryService("elg", "tcp");
 
     for (int i = 0; i < n && gLightCount < MAX_LIGHTS; i++) {
@@ -428,6 +475,8 @@ bool getLightState() {
   // Get status from the first discovered light
   Serial.println("getLightState - GET: http://" + gLights[0] + ":9123/elgato/lights");
   httpClient.begin(client, "http://" + gLights[0] + ":9123/elgato/lights"); //HTTP
+  httpClient.setConnectTimeout(2000);  // don't let a dead light stall the loop ~5s
+  httpClient.setTimeout(2000);
   httpClient.addHeader("Content-Type", "application/json");
   httpReturnCode = httpClient.GET();
 
@@ -470,6 +519,8 @@ void setLightState(String ip, JSONVar payload) {
 
   while (exitloop == false) {
     httpClient.begin(client, "http://" + ip + ":9123/elgato/lights");
+    httpClient.setConnectTimeout(2000);  // bound the stall if a light is unreachable
+    httpClient.setTimeout(2000);
     httpClient.addHeader("Content-Type", "application/json");
     httpReturnCode = httpClient.PUT(JSON.stringify(payload));
 
@@ -486,8 +537,9 @@ void setLightState(String ip, JSONVar payload) {
       Serial.printf("[HTTP] PUT... failed, error: %s\n", httpClient.errorToString(httpReturnCode).c_str());
     }
     counter++;
-    if (counter > 3) exitloop = true;
-    
+    // One retry at most: with the 2s timeout, a dead light now blocks ~4s, not ~20s.
+    if (counter > 1) exitloop = true;
+
     httpClient.end();
   }
 }
@@ -508,19 +560,21 @@ void actionLight() {
 
 }
 
-int evaluateButton(int pin, unsigned long millis, int * currentButtonState, int * lastButtonState, unsigned long * debounceTime, int actionResult) {
+// Debounced edge detector. Returns actionResult once per press (on the release
+// edge, preserving the original feel), else 0. Runs inside buttonTask on core 0;
+// the state/debounce pointers it mutates are owned exclusively by that task, and
+// it has no side effects on loop()/core-1 globals.
+int sampleButton(int pin, unsigned long now, int * currentButtonState, int * lastButtonState, unsigned long * debounceTime, int actionResult) {
 
   int result = 0;
   int pinState = digitalRead(pin);
   if (pinState != *lastButtonState) {
-    *debounceTime = millis;
+    *debounceTime = now;
   }
-  if ((millis - *debounceTime) > debounceDelay) {
+  if ((now - *debounceTime) > debounceDelay) {
     if (pinState != *currentButtonState) {
       *currentButtonState = pinState;
       if (*currentButtonState == HIGH) {
-        action = true;
-        previousActionMillis = millis;
         result = actionResult;
       }
     }
@@ -529,72 +583,80 @@ int evaluateButton(int pin, unsigned long millis, int * currentButtonState, int 
   return result;
 }
 
+// Dedicated input task (pinned to core 0). Samples all five buttons every ~5 ms
+// and latches detected presses into shared counters that loop() (core 1) drains.
+// Because this runs independently of loop(), presses are captured even while
+// loop() is blocked for seconds in mDNS discovery or HTTP calls.
+void buttonTask(void *) {
+  for (;;) {
+    unsigned long now = millis();
+
+    int on   = sampleButton(buttonOnOffPin, now, &onOffState, &lastOnOffState, &lastOnOffDebounceTime, 1);
+    int bUp  = sampleButton(buttonIncreaseBrightnessPin, now, &increaseBrightnessState, &lastIncreaseBrightnessState, &lastIncreaseBrightnessDebounceTime, BRIGHT_STEP);
+    int bDn  = sampleButton(buttonDecreaseBrightnessPin, now, &decreaseBrightnessState, &lastDecreaseBrightnessState, &lastDecreaseBrightnessDebounceTime, BRIGHT_STEP);
+    int tUp  = sampleButton(buttonIncreaseTemperaturePin, now, &increaseTemperatureState, &lastIncreaseTemperatureState, &lastIncreaseTemperatureDebounceTime, TEMP_STEP);
+    int tDn  = sampleButton(buttonDecreaseTemperaturePin, now, &decreaseTemperatureState, &lastDecreaseTemperatureState, &lastDecreaseTemperatureDebounceTime, TEMP_STEP);
+
+    if (on || bUp || bDn || tUp || tDn) {
+      taskENTER_CRITICAL(&gButtonMux);
+      gPendingOnOffToggles     += on;
+      gPendingBrightnessDelta  += (bUp - bDn);
+      gPendingTemperatureDelta += (tUp - tDn);
+      gPendingInteraction = true;
+      taskEXIT_CRITICAL(&gButtonMux);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+}
+
 void loop()
 {
   unsigned long localMillis = millis();
 
-  // OnOff Button
-  int onOffPress = evaluateButton(buttonOnOffPin,
-                                  localMillis,
-                                  & onOffState,
-                                  & lastOnOffState,
-                                  & lastOnOffDebounceTime,
-                                  1);
+  // Drain the button presses latched by buttonTask (core 0). Because that task
+  // samples continuously, presses are captured even when a previous loop
+  // iteration was blocked for seconds in network I/O.
+  int onOffToggles, brightnessDelta, temperatureDelta;
+  bool interaction;
+  taskENTER_CRITICAL(&gButtonMux);
+  onOffToggles     = gPendingOnOffToggles;     gPendingOnOffToggles = 0;
+  brightnessDelta  = gPendingBrightnessDelta;  gPendingBrightnessDelta = 0;
+  temperatureDelta = gPendingTemperatureDelta; gPendingTemperatureDelta = 0;
+  interaction      = gPendingInteraction;      gPendingInteraction = false;
+  taskEXIT_CRITICAL(&gButtonMux);
 
-  // IncreaseBrightness Button
-  int increaseBrightnessPress = evaluateButton(buttonIncreaseBrightnessPin,
-                                          localMillis,
-                                          & increaseBrightnessState,
-                                          & lastIncreaseBrightnessState,
-                                          & lastIncreaseBrightnessDebounceTime,
-                                          BRIGHT_STEP);
+  // Apply presses to the local state immediately so the display reacts instantly;
+  // the actual light PUT is sent (batched) a moment later.
+  bool changed = false;
 
-  // DecreaseBrightness Button
-  int decreaseBrightnessPress = evaluateButton(buttonDecreaseBrightnessPin,
-                                          localMillis,
-                                          & decreaseBrightnessState,
-                                          & lastDecreaseBrightnessState,
-                                          & lastDecreaseBrightnessDebounceTime,
-                                          BRIGHT_STEP);
-
-  // IncreaseTemperature Button
-  int increaseTemperaturePress = evaluateButton(buttonIncreaseTemperaturePin,
-                                          localMillis,
-                                          & increaseTemperatureState,
-                                          & lastIncreaseTemperatureState,
-                                          & lastIncreaseTemperatureDebounceTime,
-                                          TEMP_STEP);
-
-  // DecreaseTemperature Button
-  int decreaseTemperaturePress = evaluateButton(buttonDecreaseTemperaturePin,
-                                          localMillis,
-                                          & decreaseTemperatureState,
-                                          & lastDecreaseTemperatureState,
-                                          & lastDecreaseTemperatureDebounceTime,
-                                          TEMP_STEP);
-
-  // Apply each press to the local state immediately so the display reacts
-  // instantly; the actual light PUT is sent (batched) a moment later.
-  if (onOffPress) {
+  // An odd number of toggles captured during the window = one net toggle.
+  if (onOffToggles % 2 != 0) {
     onOffLightState = (onOffLightState == 0) ? 1 : 0;
+    changed = true;
   }
 
-  int brightnessDelta = increaseBrightnessPress - decreaseBrightnessPress;
   if (brightnessDelta != 0) {
     brightnessState += brightnessDelta;
     if (brightnessState < BRIGHT_MIN) brightnessState = BRIGHT_MIN;
     if (brightnessState > BRIGHT_MAX) brightnessState = BRIGHT_MAX;
+    changed = true;
   }
 
-  int temperatureDelta = increaseTemperaturePress - decreaseTemperaturePress;
   if (temperatureDelta != 0) {
     temperatureState += temperatureDelta;
     if (temperatureState < TEMP_MIN) temperatureState = TEMP_MIN;
     if (temperatureState > TEMP_MAX) temperatureState = TEMP_MAX;
+    changed = true;
+  }
+
+  // Trigger the batched network send (previously set inside evaluateButton).
+  if (changed) {
+    action = true;
   }
 
   // Any button press wakes the display and resets the idle timer (anti burn-in)
-  if (onOffPress || brightnessDelta != 0 || temperatureDelta != 0) {
+  if (interaction) {
     lastInteractionMillis = localMillis;
     wakeDisplay();
   }
@@ -611,23 +673,27 @@ void loop()
     actionLight();
   }
 
-  // Polling light. While no lights are known (e.g. a transient discovery miss
-  // at startup) retry quickly rather than waiting the full poll interval.
-  unsigned long effectivePollDelay = (gLightCount == 0) ? 30000UL : pollDelay;
+  // Polling light. While no lights are known (e.g. a transient discovery miss at
+  // startup) retry sooner than the full poll interval, but not so aggressively
+  // that the ~6s discovery dominates the loop.
+  unsigned long effectivePollDelay = (gLightCount == 0) ? 90000UL : pollDelay;
   if (((localMillis - previousPollMillis) > effectivePollDelay || previousPollMillis == 0 ) && WiFi.status() == WL_CONNECTED) {
     previousPollMillis = localMillis;
 
     // (Re)discover lights if we don't know any yet, or on a periodic interval
     // so a light that changed IP (DHCP) is picked up without a reboot.
+    bool discoveredThisPoll = false;
     if (gLightCount == 0 || (localMillis - lastDiscoverMillis) > DISCOVER_INTERVAL) {
       discoverLights();
       lastDiscoverMillis = localMillis;
+      discoveredThisPoll = true;
     }
 
     Serial.println("loop - calling getLightState()...");
-    if (!getLightState() && gLightCount > 0) {
-      // A known light stopped answering - most likely a stale IP. Force a
-      // fresh discovery and retry once so it self-heals.
+    if (!getLightState() && gLightCount > 0 && !discoveredThisPoll) {
+      // A known light stopped answering - most likely a stale IP. Force a fresh
+      // discovery and retry once so it self-heals. Skipped when we already
+      // discovered this poll, to avoid two ~6s discovery blocks back-to-back.
       Serial.println("loop - light unreachable, re-discovering...");
       discoverLights();
       lastDiscoverMillis = localMillis;
