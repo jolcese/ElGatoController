@@ -10,6 +10,28 @@ printed over serial at startup, together with the git commit it was built from.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-09
+
+### Added
+- Power-on splash screen (~4 s) with the ElGato logo plus firmware version, git
+  commit, IP address, and build date.
+
+## [0.7.0] - 2026-10-09
+
+### Fixed
+- Button presses are no longer dropped while the controller is busy with network
+  I/O. A dedicated FreeRTOS task on core 0 samples the buttons every 5 ms and
+  latches presses; `loop()` (core 1) drains them each pass. Previously a press
+  made while `loop()` was blocked in mDNS discovery (~9-17 s) was missed entirely
+  — reproduced as the "first press after the display blanks does nothing".
+
+### Changed
+- mDNS discovery blocks less: 2 query passes instead of 3, no back-to-back
+  re-discovery within a single poll, and the "no lights known" retry backs off
+  from 30 s to 90 s to avoid blind retry storms.
+- HTTP GET/PUT now use a 2 s connect/read timeout and `setLightState` retries at
+  most once, so an unreachable light stalls the loop ~4 s instead of ~20 s.
+
 ## [0.6.0] - 2026-10-01
 
 ### Changed
