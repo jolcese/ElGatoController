@@ -453,6 +453,20 @@ void discoverLights() {
       gLightCount++;
     }
   }
+
+  // mDNS can come back empty when multicast is filtered on the lights' VLAN
+  // (seen on this network: the ESP32 is on the lights' subnet yet gets no
+  // responses). The lights' IPs are stable, so fall back to a known list rather
+  // than leaving the controller with nothing to talk to. mDNS still wins
+  // whenever it does return results.
+  if (gLightCount == 0) {
+    static const char *kFallbackLights[] = { "10.30.1.22", "10.30.1.221" };
+    for (unsigned i = 0; i < sizeof(kFallbackLights) / sizeof(kFallbackLights[0]) && gLightCount < MAX_LIGHTS; i++) {
+      gLights[gLightCount++] = kFallbackLights[i];
+    }
+    Serial.printf("discoverLights - mDNS found 0; using %d fallback IP(s)\n", gLightCount);
+  }
+
   Serial.printf("discoverLights - %d light(s) found\n", gLightCount);
 }
 
@@ -473,10 +487,10 @@ bool getLightState() {
   int httpReturnCode;
 
   // Get status from the first discovered light
-  Serial.println("getLightState - GET: http://" + gLights[0] + ":9123/elgato/lights");
+  Serial.printf("getLightState - GET http://%s:9123/elgato/lights (RSSI %d dBm)\n", gLights[0].c_str(), WiFi.RSSI());
   httpClient.begin(client, "http://" + gLights[0] + ":9123/elgato/lights"); //HTTP
-  httpClient.setConnectTimeout(2000);  // don't let a dead light stall the loop ~5s
-  httpClient.setTimeout(2000);
+  httpClient.setConnectTimeout(5000);  // weak-signal links can take ~2s to respond
+  httpClient.setTimeout(5000);
   httpClient.addHeader("Content-Type", "application/json");
   httpReturnCode = httpClient.GET();
 
@@ -508,7 +522,6 @@ void setLightState(String ip, JSONVar payload) {
   int httpReturnCode;
 
   WiFiClient client;
-  client.setNoDelay(true);  // send the small PUT immediately (no Nagle buffering)
   HTTPClient httpClient;
 
   Serial.print ("PUT: http://" + ip + ":9123/elgato/lights - ");
@@ -519,8 +532,8 @@ void setLightState(String ip, JSONVar payload) {
 
   while (exitloop == false) {
     httpClient.begin(client, "http://" + ip + ":9123/elgato/lights");
-    httpClient.setConnectTimeout(2000);  // bound the stall if a light is unreachable
-    httpClient.setTimeout(2000);
+    httpClient.setConnectTimeout(5000);  // weak-signal links can take ~2s to respond
+    httpClient.setTimeout(5000);
     httpClient.addHeader("Content-Type", "application/json");
     httpReturnCode = httpClient.PUT(JSON.stringify(payload));
 
@@ -633,6 +646,10 @@ void loop()
   // An odd number of toggles captured during the window = one net toggle.
   if (onOffToggles % 2 != 0) {
     onOffLightState = (onOffLightState == 0) ? 1 : 0;
+    // Turning on at 0% brightness is invisible; bump to a usable minimum.
+    if (onOffLightState == 1 && brightnessState == 0) {
+      brightnessState = 10;
+    }
     changed = true;
   }
 

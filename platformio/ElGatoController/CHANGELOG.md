@@ -10,6 +10,24 @@ printed over serial at startup, together with the git commit it was built from.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-19
+
+### Fixed
+- Lights became uncontrollable on a weak WiFi link (measured −73 dBm): mDNS
+  returned no lights (dropped multicast) and HTTP responses took ~1.8 s, which
+  the previous 2 s timeout cut off. Raised GET/PUT timeouts to 5 s and added a
+  fallback to the known light IPs when mDNS discovery finds none, so control
+  survives mDNS/multicast outages. mDNS still takes over whenever it succeeds.
+
+### Added
+- Turning a light on while it is at 0% brightness now bumps it to 10% so "on"
+  is actually visible.
+- WiFi RSSI is logged with each state poll to make weak-signal diagnosis easy.
+
+### Removed
+- Dropped a `setNoDelay()` call that ran before the socket connected (it only
+  logged a harmless `Bad file number` error and did nothing).
+
 ## [0.8.0] - 2026-10-09
 
 ### Added
